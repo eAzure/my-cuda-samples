@@ -131,10 +131,10 @@ __global__ void Shared_GEMM_stride(float *A, float *B, float *C, int m, int n, i
     }
 }
 
-/* using register */
+/* using register 1*/
 /* time: 0.290240ms GFLOPS: 7398.992984 */
 template<int block_tile, int register_tile>
-__global__ void Register_GEMM(float *A, float *B, float *C, int m, int n, int k) {
+__global__ void Register_GEMM_1(float *A, float *B, float *C, int m, int n, int k) {
     float A_register[register_tile][register_tile], B_register[register_tile][register_tile];
     float C_register[register_tile][register_tile] = {0.f};
     constexpr int shared_size = block_tile * register_tile;
@@ -188,73 +188,83 @@ __global__ void Register_GEMM(float *A, float *B, float *C, int m, int n, int k)
     }
 }
 
-/* deal with bank conflict */
-template<int block_tile, int register_tile>
-__global__ void Bank_GEMM(float *A, float *B, float *C, int m, int n, int k) {
-    float A_register[register_tile][register_tile], B_register[register_tile][register_tile];
+/* using register 2*/
+/*
+    block_tile: one block corresponds
+    register_tile: one thread corresponds
+*/
+/* https://blog.csdn.net/qianqing13579/article/details/127359866 */
+template<int block_tile, int block_tile_k, int register_tile>
+__global__ void Register_GEMM_2(float *A, float *B, float *C, int m, int n, int k) {
+    // register
+    float A_register[register_tile] = {0.f};
+    float B_register[register_tile] = {0.f};
     float C_register[register_tile][register_tile] = {0.f};
-    constexpr int shared_size = block_tile * register_tile;
-    constexpr int offset = 0;
-    __shared__ float A_shared[shared_size][shared_size+offset], B_shared[shared_size][shared_size+offset];
 
-    // compute along k
-    for (int i=0;i<k;i+=shared_size) {
+    for (int i=0;i<k/block_tile_k; i++) {
+        __shared__ float A_shared[block_tile][block_tile_k];
+        __shared__ float B_shared[block_tile_k][block_tile];
+
         // read data from global to shared
-        for (int j=0;j<register_tile;j++) {
-            for (int h=0;h<register_tile;h++) {
-                int old_index = (threadIdx.y*register_tile+j) * shared_size + threadIdx.x*register_tile+h;
-                int new_shared_index_y = old_index / (shared_size + offset);
-                int new_shared_index_x = old_index % (shared_size + offset);
-                A_shared[new_shared_index_y][new_shared_index_x] = A[
-                    blockIdx.y*k*shared_size + i +
-                    (threadIdx.y*register_tile+j)*k +
-                    threadIdx.x*register_tile+h
-                ];
-                B_shared[new_shared_index_y][new_shared_index_x] = B[
-                    i*n + blockIdx.x * shared_size +
-                    (threadIdx.y*register_tile+j)*n +
-                    threadIdx.x*register_tile+h
-                ];
-            }
+        int numberOfElementsPerThread = (block_tile_k * block_tile) / (blockDim.x * blockDim.y);
+        // record one thread compute initial index in block
+        int startIndex = numberOfElementsPerThread * (threadIdx.y * blockDim.x + threadIdx.x);
+        for (int threadIndex=0;threadIndex<numberOfElementsPerThread;threadIndex++) {
+            int logicalIndex = startIndex + threadIndex;
+            A_shared[logicalIndex / block_tile_k][logicalIndex % block_tile_k] = A[
+                blockIdx.y * block_tile * k + i * block_tile_k + // block initial address
+                logicalIndex / block_tile_k * k + logicalIndex % block_tile_k
+            ];
+            B_shared[logicalIndex / block_tile][logicalIndex % block_tile] = B[
+                i * block_tile_k * n + blockIdx.x * block_tile + // block initial address
+                logicalIndex / block_tile * n + logicalIndex % block_tile
+            ];
         }
         __syncthreads();
-        // read data from shared to register
-        for (int ii=0;ii<shared_size;ii+=register_tile) {
-            for (int jj=0;jj<register_tile;jj++) {
-                for (int hh=0;hh<register_tile;hh++) {
-                    // 16-way bank conflict
-                    int old_index_A = (threadIdx.y*register_tile+jj) * shared_size + ii + hh;
-                    int new_index_A_y = old_index_A / (shared_size + offset);
-                    int new_index_A_x = old_index_A % (shared_size + offset);
-                    A_register[jj][hh] = A_shared[new_index_A_y][new_index_A_x];
-                    // 4-way bank conflict
-                    int old_index_B = (ii+hh) * shared_size + threadIdx.x*register_tile+jj;
-                    int new_index_B_y = old_index_B / (shared_size + offset);
-                    int new_index_B_x = old_index_B % (shared_size + offset);
-                    B_register[hh][jj] = B_shared[new_index_B_y][new_index_B_x];
-                }
+        // load data from shared into register and compute
+        for (int k_i=0;k_i<register_tile;k_i++) {
+            for (int m_i=0;m_i<register_tile;m_i++) {
+                int complete_A_index = threadIdx.y * register_tile * register_tile + m_i * register_tile + k_i;
+                A_register[m_i] = A_shared[
+                    complete_A_index / register_tile
+                ][
+                    complete_A_index % register_tile
+                ];
+            }
+            for (int n_i=0;n_i<register_tile;n_i++) {
+                int complete_B_index = threadIdx.x * register_tile + k_i * block_tile + n_i;
+                B_register[n_i] = B_shared[
+                    complete_B_index / block_tile
+                ][
+                    complete_B_index % block_tile
+                ];
             }
             // compute
-            for (int jj=0;jj<register_tile;jj++) {
-                for (int hh=0;hh<register_tile;hh++) {
-                    for (int kk=0;kk<register_tile;kk++) {
-                        C_register[jj][hh] += A_register[jj][kk] * B_register[kk][hh];
-                    }
+            for (int m_i=0;m_i<register_tile;m_i++) {
+                for (int n_i=0;n_i<register_tile;n_i++) {
+                    C_register[m_i][n_i] += A_register[m_i] * B_register[n_i];
                 }
             }
         }
         __syncthreads();
     }
-    // write data to global
-    for (int i=0;i<register_tile;i++) {
-        for (int j=0;j<register_tile;j++) {
+    // store data to global C
+    for (int m_i=0;m_i<register_tile;m_i++) {
+        for (int n_i=0;n_i<register_tile;n_i++) {
             C[
-                (blockIdx.y * shared_size + threadIdx.y * register_tile + i) * n +
-                blockIdx.x * shared_size + threadIdx.x * register_tile + j
-            ] = C_register[i][j];
+                (blockIdx.y * block_tile + threadIdx.y * register_tile) * n +
+                blockIdx.x * block_tile + threadIdx.x * register_tile +
+                m_i * n + n_i
+            ] = C_register[m_i][n_i];
         }
     }
 }
+
+/* deal with bank conflict */
+// template<int block_tile, int register_tile>
+// __global__ void Bank_GEMM(float *A, float *B, float *C, int m, int n, int k) {
+    
+// }
 
 
 int main() {
@@ -304,19 +314,27 @@ int main() {
     // dim3 grid((N-1)/(block_tile * thread_tile)+1, (M-1)/(block_tile * thread_tile)+1);
     // Shared_GEMM_stride<block_tile, thread_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
 
-    /* using register implementation */
+    /* using register implementation 1 */
     // constexpr int register_tile = 4;
     // constexpr int shared_tile = 8;
     // dim3 block(shared_tile, shared_tile);
     // dim3 grid((N-1)/(shared_tile * register_tile)+1, (M-1)/(shared_tile * register_tile)+1);
-    // Register_GEMM<shared_tile, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
+    // Register_GEMM_1<shared_tile, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
+
+    /* using register implementation 2 */
+    constexpr int block_tile = 128;
+    constexpr int register_tile = 8;
+    constexpr int block_tile_k = 8;
+    dim3 block(block_tile/register_tile, block_tile/register_tile);
+    dim3 grid((N-1)/block.x + 1, (M-1)/block.y + 1);
+    Register_GEMM_2<block_tile, block_tile_k, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
 
     /* deal with the bank conflict */
-    constexpr int register_tile = 4;
-    constexpr int shared_tile = 8;
-    dim3 block(shared_tile, shared_tile);
-    dim3 grid((N-1)/(shared_tile * register_tile)+1, (M-1)/(shared_tile * register_tile)+1);
-    Bank_GEMM<shared_tile, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
+    // constexpr int register_tile = 4;
+    // constexpr int shared_tile = 8;
+    // dim3 block(shared_tile, shared_tile);
+    // dim3 grid((N-1)/(shared_tile * register_tile)+1, (M-1)/(shared_tile * register_tile)+1);
+    // Bank_GEMM<shared_tile, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
 
     cudaEventRecord(end);
     cudaEventSynchronize(end);
