@@ -1,8 +1,10 @@
 # GEMM implementation
 ## implementation
 
-- 0-naive.cu
-- 1-wmma.cu
+- 0-naive.cu : naive implement (done)
+- 1-others.cu : add Matrix View (done)
+- 1-matrix_view.cu (done)
+- 2-wmma.cu : (doing)
 - cublas.cu
 
 ## nsight compute
