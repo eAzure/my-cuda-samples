@@ -193,6 +193,7 @@ __global__ void Register_GEMM_1(float *A, float *B, float *C, int m, int n, int 
     block_tile: one block corresponds
     register_tile: one thread corresponds
 */
+/* time: 0.310752ms GFLOPS: 6894.982545 */
 /* https://blog.csdn.net/qianqing13579/article/details/127359866 */
 template<int block_tile, int block_tile_k, int register_tile>
 __global__ void Register_GEMM_2(float *A, float *B, float *C, int m, int n, int k) {
@@ -314,7 +315,8 @@ int main() {
     constexpr int register_tile = 8;
     constexpr int block_tile_k = 8;
     dim3 block(block_tile/register_tile, block_tile/register_tile);
-    dim3 grid(N/block.x, M/block.y);
+    /* Notice! */
+    dim3 grid(N/block_tile, M/block_tile);
     Register_GEMM_2<block_tile, block_tile_k, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
 
     /* deal with the bank conflict */
