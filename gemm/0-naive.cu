@@ -201,61 +201,49 @@ __global__ void Register_GEMM_2(float *A, float *B, float *C, int m, int n, int 
     float B_register[register_tile] = {0.f};
     float C_register[register_tile][register_tile] = {0.f};
 
-    for (int i=0;i<k/block_tile_k; i++) {
+    for (int i=0;i<k/block_tile_k;i++) {
         __shared__ float A_shared[block_tile][block_tile_k];
         __shared__ float B_shared[block_tile_k][block_tile];
 
         // read data from global to shared
-        int numberOfElementsPerThread = (block_tile_k * block_tile) / (blockDim.x * blockDim.y);
+        int numberOfElementsPerThread = (block_tile * block_tile_k) / (blockDim.x * blockDim.y);
         // record one thread compute initial index in block
         int startIndex = numberOfElementsPerThread * (threadIdx.y * blockDim.x + threadIdx.x);
-        for (int threadIndex=0;threadIndex<numberOfElementsPerThread;threadIndex++) {
+        for (int threadIndex=0; threadIndex<numberOfElementsPerThread; threadIndex++) {
             int logicalIndex = startIndex + threadIndex;
-            A_shared[logicalIndex / block_tile_k][logicalIndex % block_tile_k] = A[
-                blockIdx.y * block_tile * k + i * block_tile_k + // block initial address
-                logicalIndex / block_tile_k * k + logicalIndex % block_tile_k
-            ];
-            B_shared[logicalIndex / block_tile][logicalIndex % block_tile] = B[
-                i * block_tile_k * n + blockIdx.x * block_tile + // block initial address
-                logicalIndex / block_tile * n + logicalIndex % block_tile
-            ];
+            // 每一个thread负责读入shared_mem中的一部分
+            A_shared[logicalIndex / block_tile_k][logicalIndex % block_tile_k] = 
+                A[blockIdx.y * block_tile * k + i * block_tile_k + 
+                  logicalIndex / block_tile_k * k + logicalIndex % block_tile_k];
+            B_shared[logicalIndex / block_tile][logicalIndex % block_tile] = 
+                B[i*block_tile_k*n + blockIdx.x*block_tile + 
+                  logicalIndex / block_tile * n + logicalIndex % block_tile];
         }
         __syncthreads();
         // load data from shared into register and compute
-        for (int k_i=0;k_i<register_tile;k_i++) {
-            for (int m_i=0;m_i<register_tile;m_i++) {
-                int complete_A_index = threadIdx.y * register_tile * register_tile + m_i * register_tile + k_i;
-                A_register[m_i] = A_shared[
-                    complete_A_index / register_tile
-                ][
-                    complete_A_index % register_tile
-                ];
+        for (int j=0;j<block_tile_k;j++) {
+            for (int g=0;g<register_tile;g++) {
+                A_register[g] = A_shared[threadIdx.y * register_tile + g][j];
             }
-            for (int n_i=0;n_i<register_tile;n_i++) {
-                int complete_B_index = threadIdx.x * register_tile + k_i * block_tile + n_i;
-                B_register[n_i] = B_shared[
-                    complete_B_index / block_tile
-                ][
-                    complete_B_index % block_tile
-                ];
+            for (int h=0;h<register_tile;h++) {
+                B_register[h] = B_shared[j][threadIdx.x*register_tile + h];
             }
-            // compute
-            for (int m_i=0;m_i<register_tile;m_i++) {
-                for (int n_i=0;n_i<register_tile;n_i++) {
-                    C_register[m_i][n_i] += A_register[m_i] * B_register[n_i];
+
+            for (int a=0;a<register_tile;a++) {
+                for (int b=0;b<register_tile;b++) {
+                    C_register[a][b] += A_register[a] * B_register[b];
                 }
             }
         }
         __syncthreads();
     }
-    // store data to global C
-    for (int m_i=0;m_i<register_tile;m_i++) {
-        for (int n_i=0;n_i<register_tile;n_i++) {
+    // copy from C_register to C
+    for (int i=0;i<register_tile;i++) {
+        for (int j=0;j<register_tile;j++) {            
             C[
-                (blockIdx.y * block_tile + threadIdx.y * register_tile) * n +
-                blockIdx.x * block_tile + threadIdx.x * register_tile +
-                m_i * n + n_i
-            ] = C_register[m_i][n_i];
+                (blockIdx.y * block_tile + threadIdx.y * register_tile + i) * n +
+                blockIdx.x * block_tile + threadIdx.x * register_tile + j
+            ] = C_register[i][j];
         }
     }
 }
@@ -326,7 +314,7 @@ int main() {
     constexpr int register_tile = 8;
     constexpr int block_tile_k = 8;
     dim3 block(block_tile/register_tile, block_tile/register_tile);
-    dim3 grid((N-1)/block.x + 1, (M-1)/block.y + 1);
+    dim3 grid(N/block.x, M/block.y);
     Register_GEMM_2<block_tile, block_tile_k, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
 
     /* deal with the bank conflict */
@@ -338,6 +326,9 @@ int main() {
 
     cudaEventRecord(end);
     cudaEventSynchronize(end);
+
+    cudaError_t error = cudaGetLastError();
+    printf("CUDA error: %s\n", cudaGetErrorString(error));
 
     float time_ms;
     cudaEventElapsedTime(&time_ms, start, end);
