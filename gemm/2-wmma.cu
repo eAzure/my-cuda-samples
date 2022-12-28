@@ -100,6 +100,7 @@ void record_time_throughput(const char *kernel_tag, const function<void()> &kern
 }
 
 /* wmma kernel */
+/* naive implement */
 template <int M_tile=16, int N_tile=16, int K_tile=16>
 __global__ void naive_wmma_kernel(half *A, half *B, float *C, int M, int N, int K) {
     // warp number per dim
@@ -131,6 +132,12 @@ __global__ void naive_wmma_kernel(half *A, half *B, float *C, int M, int N, int 
         wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
     }
     wmma::store_matrix_sync(C_store_index, C_frag, N, wmma::mem_row_major);
+}
+
+/* using shared memory */
+template<int M_tile=16, int N_tile=16, int K_tile=16>
+__global__ void shared_wmma_kernel(half *A, half *B, float *C, int M, int N, int K) {
+    
 }
 
 int main() {

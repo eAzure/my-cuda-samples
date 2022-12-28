@@ -3,9 +3,9 @@
 
 using namespace std;
 
-const int M = 1024;
-const int N = 1024;
-const int K = 1024;
+const int M = 2048;
+const int N = 2048;
+const int K = 2048;
 
 /* random init the data */
 void random_init_data(float *data, size_t size) {
@@ -229,7 +229,7 @@ __global__ void Register_GEMM_2(float *A, float *B, float *C, int m, int n, int 
             for (int h=0;h<register_tile;h++) {
                 B_register[h] = B_shared[j][threadIdx.x*register_tile + h];
             }
-
+            // compute
             for (int a=0;a<register_tile;a++) {
                 for (int b=0;b<register_tile;b++) {
                     C_register[a][b] += A_register[a] * B_register[b];
@@ -255,6 +255,100 @@ __global__ void Register_GEMM_2(float *A, float *B, float *C, int m, int n, int 
     
 // }
 
+/* data prefetch */
+/* compute without waiting for memory */
+/* small improvement, when shape grows big, the improvement is more obvious */
+/*refer: https://blog.csdn.net/qianqing13579/article/details/127359866*/
+template<int block_tile, int block_tile_k, int register_tile>
+__global__ void Prefetch_GEMM(float *A, float *B, float *C, int m, int n, int k) {
+    // register
+    float A_register[register_tile] = {0.f};
+    float B_register[register_tile] = {0.f};
+    float C_register[register_tile][register_tile] = {0.f};
+
+    // shared mem
+    __shared__ float A_shared[2][block_tile][block_tile_k];
+    __shared__ float B_shared[2][block_tile_k][block_tile];
+
+    // prefetch
+    int numberOfElementsPerThread = (block_tile * block_tile_k) / (blockDim.x * blockDim.y);
+    int startIndex = numberOfElementsPerThread * (threadIdx.y * blockDim.x + threadIdx.x);
+    for (int threadIndex=0;threadIndex<numberOfElementsPerThread;threadIndex++) {
+        int logicalIndex = startIndex + threadIndex;
+        A_shared[0][logicalIndex / block_tile_k][logicalIndex % block_tile_k] = 
+            A[blockIdx.y * block_tile * k + 0 * block_tile_k + 
+                logicalIndex / block_tile_k * k + logicalIndex % block_tile_k];
+        B_shared[0][logicalIndex / block_tile][logicalIndex % block_tile] = 
+            B[0*block_tile_k*n + blockIdx.x*block_tile + 
+                logicalIndex / block_tile * n + logicalIndex % block_tile];
+    }
+    __syncthreads();
+
+    int indexOfRead, indexOfWrite;
+    bool indexFlag = false;
+    for (int i=1;i<k/block_tile_k;i++) {
+        // 交替变换indexOfRead | indexOfWrite
+        indexOfRead = (int)indexFlag; // 本次读取indexOfRead(0|1) 到register中
+        indexOfWrite = 1 - indexOfRead; // 预取indexOfWrite(0|1)下一次的数据到shared_mem中
+
+        for (int j=0;j<block_tile_k;j++) {
+            for (int g=0;g<register_tile;g++) {
+                A_register[g] = A_shared[indexOfRead][threadIdx.y * register_tile + g][j];
+            }
+            for (int h=0;h<register_tile;h++) {
+                B_register[h] = B_shared[indexOfRead][j][threadIdx.x*register_tile + h];
+            }
+            // compute
+            for (int a=0;a<register_tile;a++) {
+                for (int b=0;b<register_tile;b++) {
+                    C_register[a][b] += A_register[a] * B_register[b];
+                }
+            }
+        }
+
+        // prefetch data
+        int numberOfElementsPerThread = (block_tile * block_tile_k) / (blockDim.x * blockDim.y);
+        int startIndex = numberOfElementsPerThread * (threadIdx.y * blockDim.x + threadIdx.x);
+        for (int threadIndex=0;threadIndex<numberOfElementsPerThread;threadIndex++) {
+            int logicalIndex = startIndex + threadIndex;
+            A_shared[indexOfWrite][logicalIndex / block_tile_k][logicalIndex % block_tile_k] = 
+                A[blockIdx.y * block_tile * k + i * block_tile_k + 
+                    logicalIndex / block_tile_k * k + logicalIndex % block_tile_k];
+            B_shared[indexOfWrite][logicalIndex / block_tile][logicalIndex % block_tile] = 
+                B[i*block_tile_k*n + blockIdx.x*block_tile + 
+                    logicalIndex / block_tile * n + logicalIndex % block_tile];
+        }
+        __syncthreads();
+        indexFlag = !indexFlag;
+    }
+    {
+        // 计算最后一个BK
+        for (int j=0;j<block_tile_k;j++) {
+            for (int g=0;g<register_tile;g++) {
+                A_register[g] = A_shared[indexOfWrite][threadIdx.y * register_tile + g][j];
+            }
+            for (int h=0;h<register_tile;h++) {
+                B_register[h] = B_shared[indexOfWrite][j][threadIdx.x*register_tile + h];
+            }
+            // compute
+            for (int a=0;a<register_tile;a++) {
+                for (int b=0;b<register_tile;b++) {
+                    C_register[a][b] += A_register[a] * B_register[b];
+                }
+            }
+        }
+    }
+
+    // store data to C
+    for (int i=0;i<register_tile;i++) {
+        for (int j=0;j<register_tile;j++) {            
+            C[
+                (blockIdx.y * block_tile + threadIdx.y * register_tile + i) * n +
+                blockIdx.x * block_tile + threadIdx.x * register_tile + j
+            ] = C_register[i][j];
+        }
+    }
+}
 
 int main() {
     /* host data */
@@ -311,13 +405,22 @@ int main() {
     // Register_GEMM_1<shared_tile, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
 
     /* using register implementation 2 */
+    // constexpr int block_tile = 128;
+    // constexpr int register_tile = 8;
+    // constexpr int block_tile_k = 8;
+    // dim3 block(block_tile/register_tile, block_tile/register_tile);
+    // /* Notice! */
+    // dim3 grid(N/block_tile, M/block_tile);
+    // Register_GEMM_2<block_tile, block_tile_k, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
+
+    /* using data prefetch */
     constexpr int block_tile = 128;
     constexpr int register_tile = 8;
     constexpr int block_tile_k = 8;
     dim3 block(block_tile/register_tile, block_tile/register_tile);
     /* Notice! */
     dim3 grid(N/block_tile, M/block_tile);
-    Register_GEMM_2<block_tile, block_tile_k, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
+    Prefetch_GEMM<block_tile, block_tile_k, register_tile><<<grid, block>>> (d_A, d_B, d_C, M, N, K);
 
     /* deal with the bank conflict */
     // constexpr int register_tile = 4;
