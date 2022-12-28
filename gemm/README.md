@@ -7,6 +7,9 @@
 - 2-wmma.cu : (doing)
 - cublas.cu
 
+## wmma nvcc
+nvcc -arch=sm_xx 2-wmma.cu -o wmma
+
 ## nsight compute
 
 ```

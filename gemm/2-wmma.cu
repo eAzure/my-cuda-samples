@@ -102,10 +102,10 @@ void record_time_throughput(const char *kernel_tag, const function<void()> &kern
 /* wmma kernel */
 /* naive implement */
 template <int M_tile=16, int N_tile=16, int K_tile=16>
-__global__ void naive_wmma_kernel(half *A, half *B, float *C, int M, int N, int K) {
+__global__ void naive_wmma_kernel(half *A, half *B, float *C, int m, int n, int k) {
     // warp number per dim
-    int warp_number_dim_n = N / N_tile;
-    int warp_number_dim_k = K / K_tile;
+    int warp_number_dim_n = n / N_tile;
+    int warp_number_dim_k = k / K_tile;
     // thread locate warp id
     int thread_in_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
     // transform thread_in_warp_id to 2-dim
@@ -119,24 +119,24 @@ __global__ void naive_wmma_kernel(half *A, half *B, float *C, int M, int N, int 
     wmma::fill_fragment(C_frag, 0.0f);
 
     // locate the compute index in C
-    float *C_store_index = C + thread_in_warp_m_id * M_tile *N + thread_in_warp_n_id * N_tile;
+    float *C_store_index = C + thread_in_warp_m_id * M_tile * n + thread_in_warp_n_id * N_tile;
 
     // compute along k dim
     for (int kidx=0;kidx<warp_number_dim_k;kidx++) {
-        half *A_load_index = A + thread_in_warp_m_id * M_tile * K + kidx * K_tile;
-        half *B_load_index = B + kidx * K_tile * N + thread_in_warp_n_id * N_tile;
+        half *A_load_index = A + thread_in_warp_m_id * M_tile * k + kidx * K_tile;
+        half *B_load_index = B + kidx * K_tile * n + thread_in_warp_n_id * N_tile;
 
-        wmma::load_matrix_sync(A_frag, A_load_index, K);
-        wmma::load_matrix_sync(B_frag, B_load_index, N);
+        wmma::load_matrix_sync(A_frag, A_load_index, k);
+        wmma::load_matrix_sync(B_frag, B_load_index, n);
 
         wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
     }
-    wmma::store_matrix_sync(C_store_index, C_frag, N, wmma::mem_row_major);
+    wmma::store_matrix_sync(C_store_index, C_frag, n, wmma::mem_row_major);
 }
 
 /* using shared memory */
 template<int M_tile=16, int N_tile=16, int K_tile=16>
-__global__ void shared_wmma_kernel(half *A, half *B, float *C, int M, int N, int K) {
+__global__ void shared_wmma_kernel(half *A, half *B, float *C, int m, int n, int k) {
     
 }
 
