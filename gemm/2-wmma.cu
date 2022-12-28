@@ -32,6 +32,8 @@ const int M = 1024;
 const int N = 1024;
 const int K = 1024;
 
+#define WARP_SIZE 32
+
 /* random init the data */
 void random_init_data(half *data, size_t size) {
     for (size_t i=0;i<size;i++) {
@@ -97,16 +99,17 @@ void record_time_throughput(const char *kernel_tag, const function<void()> &kern
     printf("GFLOPS: %f\n", gflops);
 }
 
-#define WARP_SIZE 32
 /* wmma kernel */
 template <int M_tile=16, int N_tile=16, int K_tile=16>
-__global__ void naive_wmma_kernel(half *A, half *B, float *C, int m, int n, int k) {
-    int idx, midx, nidx, ndim, kdim;
-    ndim = n / N_tile; // 相当于N维度上有多少个warp
-    kdim = k / K_tile;
-    idx = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE; // 该线程处于哪一个warp
-    nidx = idx % ndim; // 将一维warp_id展为二维
-    midx = idx / ndim;
+__global__ void naive_wmma_kernel(half *A, half *B, float *C, int M, int N, int K) {
+    // warp number per dim
+    int warp_number_dim_n = N / N_tile;
+    int warp_number_dim_k = K / K_tile;
+    // thread locate warp id
+    int thread_in_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    // transform thread_in_warp_id to 2-dim
+    int thread_in_warp_m_id = thread_in_warp_id / warp_number_dim_n; // 将一维warp_id展为二维
+    int thread_in_warp_n_id = thread_in_warp_id % warp_number_dim_n;
 
     wmma::fragment<wmma::matrix_a, M_tile, N_tile, K_tile, half, wmma::row_major> A_frag;
     wmma::fragment<wmma::matrix_b, M_tile, N_tile, K_tile, half, wmma::row_major> B_frag;
@@ -114,18 +117,20 @@ __global__ void naive_wmma_kernel(half *A, half *B, float *C, int m, int n, int 
 
     wmma::fill_fragment(C_frag, 0.0f);
 
-    float *C_unique = C + nidx * N_tile + midx * M_tile * n;
+    // locate the compute index in C
+    float *C_store_index = C + thread_in_warp_m_id * M_tile *N + thread_in_warp_n_id * N_tile;
 
-    for (int kidx=0;kidx<kdim;kidx++) {
-        half *A_unique = A + kidx * K_tile + midx * M_tile * k;
-        half *B_unique = B + nidx * N_tile + kidx * K_tile * n;
+    // compute along k dim
+    for (int kidx=0;kidx<warp_number_dim_k;kidx++) {
+        half *A_load_index = A + thread_in_warp_m_id * M_tile * K + kidx * K_tile;
+        half *B_load_index = B + kidx * K_tile * N + thread_in_warp_n_id * N_tile;
 
-        wmma::load_matrix_sync(A_frag, A_unique, k);
-        wmma::load_matrix_sync(B_frag, B_unique, n);
+        wmma::load_matrix_sync(A_frag, A_load_index, K);
+        wmma::load_matrix_sync(B_frag, B_load_index, N);
 
         wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
     }
-    wmma::store_matrix_sync(C_unique, C_frag, n, wmma::mem_row_major);
+    wmma::store_matrix_sync(C_store_index, C_frag, N, wmma::mem_row_major);
 }
 
 int main() {
@@ -152,23 +157,24 @@ int main() {
     /* call the kernel and record the time and the throughput */
 
     /* call the kernel */
-    int GRID_DIM,BLOCK_DIM,nwarp;
-    int M_tile = 16;
-    int N_tile = 16;
-    int K_tile = 16;
+    constexpr int M_tile = 16;
+    constexpr int N_tile = 16;
+    constexpr int K_tile = 16;
+    int GRID_DIM, BLOCK_DIM;
+    int number_of_warp = (M/M_tile) * (N/N_tile);
+    int number_of_thread = number_of_warp * WARP_SIZE;
     int BLOCK_DIM_DEFAULT = 512;
-    nwarp = (M/M_tile) * (N/N_tile);
-    if(nwarp*WARP_SIZE < BLOCK_DIM_DEFAULT){
+    
+    if(number_of_thread < BLOCK_DIM_DEFAULT){
         GRID_DIM = 1;
-        BLOCK_DIM = nwarp*WARP_SIZE;
+        BLOCK_DIM = number_of_thread;
     }else{
-        GRID_DIM = (nwarp*WARP_SIZE)%BLOCK_DIM_DEFAULT ? 
-            nwarp*WARP_SIZE/BLOCK_DIM_DEFAULT+1 : nwarp*WARP_SIZE/BLOCK_DIM_DEFAULT ;
+        GRID_DIM = number_of_thread % BLOCK_DIM_DEFAULT ? 
+            number_of_thread / BLOCK_DIM_DEFAULT + 1 : number_of_thread / BLOCK_DIM_DEFAULT ;
         BLOCK_DIM = BLOCK_DIM_DEFAULT;
     }
-    // GRID_DIM = 8 BLOCK_DIM = 512
-    record_time_throughput("wmma_naive", [&]{
-        naive_wmma_kernel<<<GRID_DIM, BLOCK_DIM>>>(d_A, d_B, d_C, M, N, K);
+    record_time_throughput("wmma_naive", [&](){
+        naive_wmma_kernel<M_tile, N_tile, K_tile><<<GRID_DIM, BLOCK_DIM>>>(d_A, d_B, d_C, M, N, K);
     ;}, 100);
 
     /* copy result from device to host */
